@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.idea/
+.venv/
+venv/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+users.json
