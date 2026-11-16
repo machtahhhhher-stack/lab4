@@ -10,9 +10,17 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.types import BotCommand
+
+try:
+    # ошибки прокси (если Telegram открывается только через VPN-прокси)
+    from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
+    PROXY_ERRORS: tuple[type[Exception], ...] = (ProxyConnectionError, ProxyError, ProxyTimeoutError)
+except ImportError:      # библиотека не установлена - значит, прокси и не используется
+    PROXY_ERRORS = ()
 
 from movies.api import MovieApi
 from movies.handlers import router
@@ -34,17 +42,43 @@ COMMANDS = [
 ]
 
 
+def read_setting(name: str) -> str:
+    """Значение из переменной окружения или из файла .env (строка ИМЯ=значение)."""
+    value = os.getenv(name, "")
+    if not value and ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith(f"{name}="):
+                value = line.split("=", 1)[1].strip()
+    return value
+
+
 def read_token() -> str:
     """Токен - секрет, поэтому он не в коде, а в файле .env (его нет на GitHub)."""
-    token = os.getenv("BOT_TOKEN", "")
-    if not token and ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-            if line.startswith("BOT_TOKEN="):
-                token = line.split("=", 1)[1].strip()
+    token = read_setting("BOT_TOKEN")
     if not token or ":" not in token:
         sys.exit("Не найден токен бота. Создайте файл .env со строкой BOT_TOKEN=... "
                  "(образец - .env.example)")
     return token
+
+
+def make_session() -> AiohttpSession | None:
+    """Если Telegram в сети заблокирован, бот может ходить к нему через прокси
+    от VPN-программы: строка PROXY=socks5://127.0.0.1:10808 в файле .env."""
+    proxy = read_setting("PROXY")
+    if not proxy:
+        return None   # обычное прямое подключение
+    logging.info("Подключение к Telegram через прокси %s", proxy)
+    return AiohttpSession(proxy=proxy)
+
+
+NO_CONNECTION = (
+    "Нет связи с серверами Telegram (api.telegram.org).\n"
+    "  * Проверьте интернет.\n"
+    "  * Если Telegram у вас работает только через VPN - включите в VPN-программе режим\n"
+    "    «весь трафик» / TUN / «VPN-режим», или впишите в файл .env строку с прокси, например\n"
+    "    PROXY=socks5://127.0.0.1:10808  (порт смотрите в настройках VPN-программы).\n"
+    "  * Или раздайте интернет с телефона."
+)
 
 
 async def main() -> None:
@@ -53,7 +87,8 @@ async def main() -> None:
     if store.warning:
         logging.warning(store.warning)
     api = MovieApi()
-    bot = Bot(read_token(), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(read_token(), session=make_session(),
+              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     # api и store будут переданы в обработчики автоматически (по имени параметра)
     dp = Dispatcher(api=api, store=store)
     dp.include_router(router)
@@ -64,6 +99,9 @@ async def main() -> None:
         await dp.start_polling(bot)
     except TelegramUnauthorizedError:
         sys.exit("Telegram не принял токен - проверьте строку BOT_TOKEN в файле .env")
+    except (TelegramNetworkError, OSError, *PROXY_ERRORS) as error:
+        # нет интернета, Telegram заблокирован или прокси не отвечает
+        sys.exit(f"{NO_CONNECTION}\n\nПодробности: {error}")
     finally:
         await api.close()
         await bot.session.close()
